@@ -11,15 +11,16 @@ class DatabaseMiddleware(BaseMiddleware):
         self.session_pool = session_pool
 
     async def __call__(
-        self,
-        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
-        event: Message,
-        data: Dict[str, Any],
+            self,
+            handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+            event: Message,
+            data: Dict[str, Any],
     ) -> Any:
         async with self.session_pool() as session:
             repo = RequestsRepo(session)
 
-            user = await repo.users.create_user(event.from_user.id, ...)
+            user = await repo.users.get_or_create_user(event.from_user.id, event.from_user.full_name,
+                                                       username=event.from_user.username)
 
             data["session"] = session
             data["repo"] = repo

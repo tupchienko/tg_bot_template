@@ -2,13 +2,21 @@ import asyncio
 import logging
 
 import betterlogging as bl
+import openai
+import pytz
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from alembic import command
+from alembic.config import Config as AlembicConfig
 from aiogram.fsm.storage.redis import RedisStorage, DefaultKeyBuilder
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from tgbot.config import load_config, Config
+from config import load_config, Config
+from infrastructure.database.setup import create_engine, create_session_pool
 from tgbot.handlers import routers_list
+from tgbot.handlers.user import start_router, consultation_router
 from tgbot.middlewares.config import ConfigMiddleware
+from tgbot.middlewares.database import DatabaseMiddleware
 from tgbot.services import broadcaster
 
 
@@ -16,20 +24,28 @@ async def on_startup(bot: Bot, admin_ids: list[int]):
     await broadcaster.broadcast(bot, admin_ids, "Бот був запущений")
 
 
-def register_global_middlewares(dp: Dispatcher, config: Config, session_pool=None):
-    """
-    Register global middlewares for the given dispatcher.
-    Global middlewares here are the ones that are applied to all the handlers (you specify the type of update)
+def run_upgrade():
+    try:
+        config = AlembicConfig("alembic.ini")
+        config.attributes['configure_logger'] = False
 
-    :param dp: The dispatcher instance.
-    :type dp: Dispatcher
-    :param config: The configuration object from the loaded configuration.
-    :param session_pool: Optional session pool object for the database using SQLAlchemy.
-    :return: None
-    """
+        logging.info("Starting database upgrade process")
+        command.upgrade(config, "head")
+        logging.info("Database upgrade completed successfully")
+
+    except Exception as e:
+        logging.error("An error occurred during database upgrade: %s", str(e))
+
+
+def register_router(dp: Dispatcher):
+    dp.include_router(start_router)
+    dp.include_router(consultation_router)
+
+
+def register_global_middlewares(dp: Dispatcher, config: Config, session_pool=None):
     middleware_types = [
         ConfigMiddleware(config),
-        # DatabaseMiddleware(session_pool),
+        DatabaseMiddleware(session_pool),
     ]
 
     for middleware_type in middleware_types:
@@ -38,20 +54,6 @@ def register_global_middlewares(dp: Dispatcher, config: Config, session_pool=Non
 
 
 def setup_logging():
-    """
-    Set up logging configuration for the application.
-
-    This method initializes the logging configuration for the application.
-    It sets the log level to INFO and configures a basic colorized log for
-    output. The log format includes the filename, line number, log level,
-    timestamp, logger name, and log message.
-
-    Returns:
-        None
-
-    Example usage:
-        setup_logging()
-    """
     log_level = logging.INFO
     bl.basic_colorized_config(level=log_level)
 
@@ -64,16 +66,6 @@ def setup_logging():
 
 
 def get_storage(config):
-    """
-    Return storage based on the provided configuration.
-
-    Args:
-        config (Config): The configuration object.
-
-    Returns:
-        Storage: The storage object based on the configuration.
-
-    """
     if config.tg_bot.use_redis:
         return RedisStorage.from_url(
             config.redis.dsn(),
@@ -84,24 +76,26 @@ def get_storage(config):
 
 
 async def main():
-    setup_logging()
-
     config = load_config(".env")
     storage = get_storage(config)
-
+    openai.api_key = config.misc.openai_api_key
     bot = Bot(token=config.tg_bot.token, parse_mode="HTML")
     dp = Dispatcher(storage=storage)
+    scheduler = AsyncIOScheduler(timezone=pytz.UTC)
+    register_router(dp)
+    engine = create_engine(config.db)
+    sqlalchemy_session_pool = create_session_pool(engine)
+    register_global_middlewares(dp, config, session_pool=sqlalchemy_session_pool)
 
-    dp.include_routers(*routers_list)
-
-    register_global_middlewares(dp, config)
-
+    scheduler.start()
     await on_startup(bot, config.tg_bot.admin_ids)
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     try:
+        setup_logging()
+        run_upgrade()
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logging.error("Бот був вимкнений!")
